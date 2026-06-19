@@ -1,0 +1,86 @@
+name: DevSecOps CI/CD - Juice Shop
+
+on:
+  push:
+    branches: [ "devsecops-pipeline", "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+
+jobs:
+  build-test-security-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout du code
+        uses: actions/checkout@v4
+
+      - name: Installer Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Installer les dépendances
+        run: npm ci
+
+      - name: Build de l'application
+        run: npm run build --if-present
+
+      - name: Tests applicatifs
+        run: npm test --if-present
+
+      - name: Créer dossier rapports
+        run: mkdir -p reports
+
+      - name: SAST - Analyse du code avec Semgrep
+        run: |
+          python -m pip install semgrep
+          semgrep scan --config p/owasp-top-ten --json --output reports/semgrep-report.json || true
+
+      - name: SCA - Analyse dépendances avec Trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: json
+          output: reports/trivy-fs-report.json
+          exit-code: 0
+
+      - name: Secrets - Analyse avec Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        continue-on-error: true
+
+      - name: Build image Docker
+        run: docker build -t juice-shop-secure:${{ github.sha }} .
+
+      - name: Scan image Docker avec Trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: juice-shop-secure:${{ github.sha }}
+          format: json
+          output: reports/trivy-image-report.json
+          exit-code: 0
+
+      - name: Déploiement environnement de test
+        run: |
+          docker run -d --name juice-shop-test -p 3000:3000 juice-shop-secure:${{ github.sha }}
+          sleep 30
+          curl -I http://localhost:3000
+
+      - name: DAST - Analyse dynamique avec OWASP ZAP
+        run: |
+          docker run --network host -v $(pwd)/reports:/zap/wrk/:rw ghcr.io/zaproxy/zaproxy:stable zap-baseline.py \
+            -t http://localhost:3000 \
+            -r zap-report.html \
+            -J zap-report.json || true
+
+      - name: Conserver les rapports
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-reports
+          path: reports/
